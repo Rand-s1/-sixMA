@@ -19,11 +19,15 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 使用你原有的CSS样式
+# 自定义CSS样式
 st.markdown("""
 <style>
-    /* 复用你的CSS样式 */
-    .main { padding-top: 2rem; }
+    /* 主要背景和主题 */
+    .main {
+        padding-top: 2rem;
+    }
+    
+    /* 标题样式 */
     .big-title {
         font-size: 3rem;
         font-weight: 700;
@@ -33,12 +37,34 @@ st.markdown("""
         text-align: center;
         margin-bottom: 1rem;
     }
+    
     .subtitle {
         text-align: center;
         color: #666;
         font-size: 1.2rem;
         margin-bottom: 2rem;
     }
+    
+    /* 卡片样式 */
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin: 0.5rem 0;
+    }
+    
+    .stat-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 15px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        border-left: 4px solid #4ecdc4;
+        margin: 1rem 0;
+    }
+    
+    /* 按钮样式 */
     .stButton > button {
         width: 100%;
         background: linear-gradient(90deg, #ff6b6b, #4ecdc4);
@@ -50,8 +76,39 @@ st.markdown("""
         font-weight: 600;
         transition: all 0.3s ease;
     }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);
+    }
+    
+    /* 数据表格样式 */
+    .dataframe {
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    
+    /* 侧边栏样式 */
+    .sidebar .sidebar-content {
+        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+    }
+    
+    /* 警告和信息框样式 */
+    .stAlert {
+        border-radius: 10px;
+    }
+    
+    /* 进度条样式 */
+    .stProgress > div > div {
+        background: linear-gradient(90deg, #ff6b6b, #4ecdc4);
+        border-radius: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # 配置常量
 class MAConfig:
@@ -76,7 +133,7 @@ class MAConfig:
 def create_header():
     """创建页面头部"""
     st.markdown('<h1 class="big-title">📊 鹅的均线密集度扫描器 Pro</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subtitle">🎯 MA20/60/120 + EMA20/60/120 密集区域扫描</p>', unsafe_allow_html=True)
+    st.markdown('<p class="subtitle">🎯 MA20/60/120 + EMA20/60/120 密集区域扫描 + MA20触碰检测</p>', unsafe_allow_html=True)
     st.markdown("---")
 
 def create_ma_sidebar():
@@ -120,10 +177,10 @@ def create_ma_sidebar():
             show_charts = st.checkbox("显示图表分析", value=True)
             show_ma_values = st.checkbox("显示均线数值", value=False)
             min_price = st.number_input("最低价格过滤", value=0.0, help="过滤价格过低的币种")
+            ma20_touch_only = st.checkbox("仅显示MA20触碰", value=False, help="只显示有MA20触碰的结果")
             
-        return timeframe, density_threshold, volume_top_percent, show_charts, show_ma_values, min_price
+        return timeframe, density_threshold, volume_top_percent, show_charts, show_ma_values, min_price, ma20_touch_only
 
-# 复用你的API函数
 def ping_endpoint(endpoint: str) -> bool:
     """测试端点是否可用"""
     url = f"{endpoint}/api/v2/mix/market/candles"
@@ -159,8 +216,10 @@ def get_usdt_symbols(base: str) -> List[str]:
         if j.get("code") != "00000":
             raise RuntimeError(f"获取交易对失败: {j}")
         symbols = [c["symbol"] for c in j["data"]]
+        logger.info(f"找到 {len(symbols)} 个USDT永续合约")
         return symbols
     except Exception as e:
+        logger.error(f"获取交易对错误: {e}")
         raise
 
 def fetch_candles(base: str, symbol: str, granularity: str) -> pd.DataFrame:
@@ -187,6 +246,7 @@ def fetch_candles(base: str, symbol: str, granularity: str) -> pd.DataFrame:
         df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms")
         return df.sort_values("ts").reset_index(drop=True)
     except Exception as e:
+        logger.error(f"{symbol} K线获取失败: {e}")
         return pd.DataFrame()
 
 def fetch_all_tickers(base: str) -> Dict[str, dict]:
@@ -198,37 +258,54 @@ def fetch_all_tickers(base: str) -> Dict[str, dict]:
         r = requests.get(url, params=params, timeout=5)
         j = r.json()
         
+        logger.info(f"Ticker API响应: code={j.get('code')}, msg={j.get('msg')}")
+        
         if j.get("code") != "00000":
+            logger.error(f"API返回错误: {j}")
             return {}
             
         if not isinstance(j.get("data"), list):
+            logger.error(f"API数据格式错误: {type(j.get('data'))}")
             return {}
         
         tickers = {}
         for item in j["data"]:
             try:
+                # 打印第一个item的结构，用于调试
+                if len(tickers) == 0:
+                    logger.info(f"Ticker数据结构示例: {list(item.keys())}")
+                
+                # 兼容不同的字段名
                 symbol = item.get("symbol", "")
                 if not symbol:
                     continue
                 
-                # 处理不同的字段名
+                # 尝试不同的字段名
                 change24h = 0.0
                 if "change24h" in item:
                     change24h = float(item["change24h"]) * 100
                 elif "chgUtc" in item:
                     change24h = float(item["chgUtc"]) * 100
+                elif "changeUtc24h" in item:
+                    change24h = float(item["changeUtc24h"]) * 100
                 
+                # 成交量字段
                 volume = 0.0
                 if "baseVolume" in item:
                     volume = float(item["baseVolume"])
                 elif "baseVol" in item:
                     volume = float(item["baseVol"])
+                elif "vol24h" in item:
+                    volume = float(item["vol24h"])
                 
+                # 价格字段
                 price = 0.0
                 if "close" in item:
                     price = float(item["close"])
                 elif "last" in item:
                     price = float(item["last"])
+                elif "lastPr" in item:
+                    price = float(item["lastPr"])
                 
                 tickers[symbol] = {
                     "change24h": change24h,
@@ -236,17 +313,85 @@ def fetch_all_tickers(base: str) -> Dict[str, dict]:
                     "price": price
                 }
                 
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning(f"处理ticker数据失败 {item.get('symbol', 'unknown')}: {e}")
                 continue
         
+        logger.info(f"成功获取 {len(tickers)} 个ticker数据")
         return tickers
         
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        logger.error(f"网络请求失败: {e}")
         return {}
+    except Exception as e:
+        logger.error(f"获取ticker数据失败: {e}")
+        return {}
+
+def check_ma20_touch(ma20_value: float, k_high: float, k_low: float, k_open: float, k_close: float) -> dict:
+    """
+    检查K线是否触碰MA20线
+    返回详细的触碰信息
+    """
+    if ma20_value is None:
+        return {
+            'touched': False,
+            'touch_type': 'none',
+            'detail': '无MA20数据'
+        }
+    
+    # 允许的误差范围（0.1%）
+    tolerance = ma20_value * 0.001
+    
+    # 检查各种触碰情况
+    touch_conditions = {
+        'high_touch': abs(k_high - ma20_value) <= tolerance,  # 最高价触碰
+        'low_touch': abs(k_low - ma20_value) <= tolerance,    # 最低价触碰
+        'open_touch': abs(k_open - ma20_value) <= tolerance,  # 开盘价触碰
+        'close_touch': abs(k_close - ma20_value) <= tolerance, # 收盘价触碰
+        'cross_through': k_low <= ma20_value <= k_high,       # K线穿过MA20
+        'open_close_cross': (k_open <= ma20_value <= k_close) or (k_close <= ma20_value <= k_open)  # 开收盘价跨越
+    }
+    
+    # 判断触碰类型
+    if touch_conditions['cross_through']:
+        if touch_conditions['open_close_cross']:
+            if k_close > k_open:
+                touch_type = '阳线穿越'
+                detail = f'阳线穿越MA20 (开:{k_open:.4f} 收:{k_close:.4f} MA20:{ma20_value:.4f})'
+            else:
+                touch_type = '阴线穿越'
+                detail = f'阴线穿越MA20 (开:{k_open:.4f} 收:{k_close:.4f} MA20:{ma20_value:.4f})'
+        else:
+            touch_type = '影线触碰'
+            detail = f'影线触碰MA20 (高:{k_high:.4f} 低:{k_low:.4f} MA20:{ma20_value:.4f})'
+    elif touch_conditions['high_touch']:
+        touch_type = '上影触碰'
+        detail = f'上影线精确触碰MA20 ({k_high:.4f}≈{ma20_value:.4f})'
+    elif touch_conditions['low_touch']:
+        touch_type = '下影触碰'
+        detail = f'下影线精确触碰MA20 ({k_low:.4f}≈{ma20_value:.4f})'
+    elif touch_conditions['close_touch']:
+        touch_type = '收盘触碰'
+        detail = f'收盘价精确触碰MA20 ({k_close:.4f}≈{ma20_value:.4f})'
+    elif touch_conditions['open_touch']:
+        touch_type = '开盘触碰'
+        detail = f'开盘价精确触碰MA20 ({k_open:.4f}≈{ma20_value:.4f})'
+    else:
+        return {
+            'touched': False,
+            'touch_type': 'none',
+            'detail': f'未触碰MA20 (区间:{k_low:.4f}-{k_high:.4f} MA20:{ma20_value:.4f})'
+        }
+    
+    return {
+        'touched': True,
+        'touch_type': touch_type,
+        'detail': detail
+    }
 
 def calculate_ma_density(df: pd.DataFrame, density_threshold: float) -> Tuple[Optional[dict], int]:
     """
-    计算均线密集度
+    计算均线密集度，并检测K线是否触碰MA20
     返回: (density_info, candle_count)
     """
     try:
@@ -265,6 +410,11 @@ def calculate_ma_density(df: pd.DataFrame, density_threshold: float) -> Tuple[Op
         
         for period in MAConfig.EMA_PERIODS:
             mas[f'EMA{period}'] = ta.trend.ema_indicator(close_series, window=period)
+        
+        # 获取K线的高低价数据
+        high_series = pd.Series(df["high"].astype(float)).reset_index(drop=True)
+        low_series = pd.Series(df["low"].astype(float)).reset_index(drop=True)
+        open_series = pd.Series(df["open"].astype(float)).reset_index(drop=True)
         
         # 检查最近N根K线的密集度
         current_price = close_series.iloc[-1]
@@ -294,6 +444,16 @@ def calculate_ma_density(df: pd.DataFrame, density_threshold: float) -> Tuple[Op
             
             # 检查是否满足密集度条件
             if density_range <= density_threshold:
+                # 🎯 检查K线是否触碰MA20
+                ma20_value = ma_details.get('MA20', None)
+                k_high = high_series.iloc[idx]
+                k_low = low_series.iloc[idx]
+                k_open = open_series.iloc[idx]
+                k_close = close_series.iloc[idx]
+                
+                # 检查K线是否触碰MA20的逻辑
+                ma20_touch_info = check_ma20_touch(ma20_value, k_high, k_low, k_open, k_close)
+                
                 # 计算均线中心与当前价格的距离
                 ma_center = (max_ma + min_ma) / 2
                 distance_from_price = abs((ma_center - current_price) / current_price) * 100
@@ -306,7 +466,19 @@ def calculate_ma_density(df: pd.DataFrame, density_threshold: float) -> Tuple[Op
                     'distance_from_price': distance_from_price,
                     'ma_details': ma_details,
                     'candle_index': i,  # 第几根K线前
-                    'position_vs_price': 'above' if ma_center > current_price else 'below'
+                    'position_vs_price': 'above' if ma_center > current_price else 'below',
+                    
+                    # 🎯 MA20触碰信息
+                    'ma20_touch': ma20_touch_info['touched'],
+                    'ma20_touch_type': ma20_touch_info['touch_type'],
+                    'ma20_touch_detail': ma20_touch_info['detail'],
+                    'ma20_value': ma20_value,
+                    'k_line_info': {
+                        'open': k_open,
+                        'high': k_high,
+                        'low': k_low,
+                        'close': k_close
+                    }
                 }
                 
                 # 取密集度最好的(范围最小的)
@@ -316,6 +488,7 @@ def calculate_ma_density(df: pd.DataFrame, density_threshold: float) -> Tuple[Op
         return best_density, candle_count
         
     except Exception as e:
+        logger.error(f"指标计算错误: {e}")
         return None, 0
 
 def filter_by_volume(tickers: Dict[str, dict], top_percent: int) -> set:
@@ -337,9 +510,17 @@ def filter_by_volume(tickers: Dict[str, dict], top_percent: int) -> set:
     # 返回前N%的交易对
     return {symbol for symbol, _ in sorted_by_volume[:top_count]}
 
+def fetch_candles_wrapper(args) -> tuple:
+    """并行获取K线数据的包装函数"""
+    base, symbol, granularity = args
+    df = fetch_candles(base, symbol, granularity)
+    if not df.empty:
+        df["symbol"] = symbol
+    return symbol, df
+
 def scan_ma_density(base: str, symbols: List[str], granularity: str, 
                    density_threshold: float, volume_top_percent: int, 
-                   min_price: float = 0) -> Tuple[List[dict], dict]:
+                   min_price: float = 0, ma20_touch_only: bool = False) -> Tuple[List[dict], dict]:
     """扫描均线密集度"""
     start_time = time.time()
     results = []
@@ -348,8 +529,8 @@ def scan_ma_density(base: str, symbols: List[str], granularity: str,
     with st.spinner("📊 正在获取市场数据..."):
         tickers = fetch_all_tickers(base)
         if not tickers:
-            st.warning("⚠️ 无法获取完整的市场数据")
-            return [], {}
+            st.warning("⚠️ 无法获取完整的市场数据，将使用默认值")
+            tickers = {}
     
     # 按成交量过滤
     volume_filtered_symbols = filter_by_volume(tickers, volume_top_percent)
@@ -367,8 +548,7 @@ def scan_ma_density(base: str, symbols: List[str], granularity: str,
     processed = 0
     
     with ThreadPoolExecutor(max_workers=MAConfig.MAX_WORKERS) as executor:
-        futures = [executor.submit(lambda args: (args[1], fetch_candles(args[0], args[1], args[2])), 
-                                 (base, symbol, granularity)) for symbol in filtered_symbols]
+        futures = [executor.submit(fetch_candles_wrapper, (base, symbol, granularity)) for symbol in filtered_symbols]
         
         for future in as_completed(futures):
             symbol, df = future.result()
@@ -387,7 +567,7 @@ def scan_ma_density(base: str, symbols: List[str], granularity: str,
     status_container.empty()
     
     # 处理数据
-    with st.spinner("🧮 正在计算均线密集度..."):
+    with st.spinner("🧮 正在计算均线密集度和MA20触碰..."):
         insufficient_data = []
         
         for symbol in filtered_symbols:
@@ -402,9 +582,18 @@ def scan_ma_density(base: str, symbols: List[str], granularity: str,
                     insufficient_data.append(symbol)
                     continue
                 
-                ticker_data = tickers.get(symbol, {"change24h": 0, "volume": 0, "price": 0})
+                # 如果设置了只显示MA20触碰，则过滤
+                if ma20_touch_only and not density_info["ma20_touch"]:
+                    continue
                 
-                # 价格过滤
+                # 使用默认值如果ticker数据不可用
+                ticker_data = tickers.get(symbol, {
+                    "change24h": 0, 
+                    "volume": 0, 
+                    "price": 0
+                })
+                
+                # 应用价格过滤
                 if ticker_data["price"] < min_price:
                     continue
                 
@@ -421,14 +610,22 @@ def scan_ma_density(base: str, symbols: List[str], granularity: str,
                     "min_ma": density_info["min_ma"],
                     "ma_center": density_info["ma_center"],
                     "ma_details": density_info["ma_details"],
-                    "k_lines": candle_count
+                    "k_lines": candle_count,
+                    
+                    # MA20触碰信息
+                    "ma20_touch": density_info["ma20_touch"],
+                    "ma20_touch_type": density_info["ma20_touch_type"],
+                    "ma20_touch_detail": density_info["ma20_touch_detail"],
+                    "ma20_value": density_info["ma20_value"],
+                    "k_line_info": density_info["k_line_info"]
                 })
                     
             except Exception as e:
+                logger.warning(f"{symbol} 处理失败: {e}")
                 continue
     
-    # 按密集度排序(密集度越小越好)
-    results.sort(key=lambda x: x["density_range"])
+    # 优先显示有MA20触碰的结果，然后按密集度排序
+    results.sort(key=lambda x: (not x["ma20_touch"], x["density_range"]))
     
     scan_stats = {
         "scan_time": time.time() - start_time,
@@ -449,16 +646,26 @@ def format_ma_dataframe(df: pd.DataFrame, show_ma_values: bool = False) -> pd.Da
     def add_signal_icon(row):
         density = row["density_range"]
         position = row["position"]
+        ma20_touch = row["ma20_touch"]
         
+        # 基础密集度图标
         if density < 1.0:
             icon = "🎯"  # 极度密集
         elif density < 2.0:
             icon = "🔥"  # 高度密集
         else:
             icon = "📊"  # 密集
-            
+        
+        # MA20触碰标识
+        if ma20_touch:
+            ma20_icon = "🎪"  # 触碰MA20的特殊标识
+        else:
+            ma20_icon = ""
+        
+        # 位置图标
         pos_icon = "⬆️" if position == "above" else "⬇️"
-        return f"{icon}{pos_icon} {row['symbol']}"
+        
+        return f"{icon}{ma20_icon}{pos_icon} {row['symbol']}"
     
     df_formatted = df.copy()
     df_formatted["交易对"] = df.apply(add_signal_icon, axis=1)
@@ -467,14 +674,18 @@ def format_ma_dataframe(df: pd.DataFrame, show_ma_values: bool = False) -> pd.Da
     df_formatted["K线前"] = df_formatted["candle_ago"].apply(lambda x: f"{x}根前")
     df_formatted["24h涨跌"] = df_formatted["change24h"].apply(lambda x: f"{x:+.2f}%")
     df_formatted["位置"] = df_formatted["position"].apply(lambda x: "价格上方" if x == "above" else "价格下方")
+    df_formatted["MA20触碰"] = df_formatted.apply(
+        lambda row: f"✅ {row['ma20_touch_type']}" if row["ma20_touch"] else "❌ 未触碰", axis=1
+    )
     
-    columns = ["交易对", "密集度", "距价格", "位置", "K线前", "24h涨跌"]
+    columns = ["交易对", "密集度", "距价格", "位置", "K线前", "MA20触碰", "24h涨跌"]
     
     if show_ma_values:
         df_formatted["价格区间"] = df.apply(
             lambda row: f"{row['min_ma']:.4f} ~ {row['max_ma']:.4f}", axis=1
         )
-        columns.append("价格区间")
+        df_formatted["MA20值"] = df_formatted["ma20_value"].apply(lambda x: f"{x:.4f}" if x else "N/A")
+        columns.extend(["价格区间", "MA20值"])
     
     return df_formatted[columns]
 
@@ -485,8 +696,8 @@ def create_ma_statistics_cards(results: List[dict], scan_stats: dict):
         
     very_dense = len([r for r in results if r["density_range"] < 1.0])
     dense = len([r for r in results if 1.0 <= r["density_range"] < 2.0])
+    ma20_touched = len([r for r in results if r["ma20_touch"]])
     above_price = len([r for r in results if r["position"] == "above"])
-    below_price = len([r for r in results if r["position"] == "below"])
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -506,16 +717,16 @@ def create_ma_statistics_cards(results: List[dict], scan_stats: dict):
         
     with col3:
         st.metric(
-            label="⬆️ 价格上方",
-            value=f"{above_price}",
-            help="均线密集区在当前价格上方"
+            label="🎪 MA20触碰",
+            value=f"{ma20_touched}",
+            help="K线触碰MA20的币种数量"
         )
         
     with col4:
         st.metric(
-            label="⬇️ 价格下方",
-            value=f"{below_price}",
-            help="均线密集区在当前价格下方"
+            label="⬆️ 价格上方",
+            value=f"{above_price}",
+            help="均线密集区在当前价格上方"
         )
 
 def create_density_chart(results: List[dict]):
@@ -542,19 +753,46 @@ def create_density_chart(results: List[dict]):
     
     return fig
 
+def create_ma20_touch_chart(results: List[dict]):
+    """创建MA20触碰类型分布图"""
+    if not results:
+        return None
+        
+    df = pd.DataFrame(results)
+    ma20_touched = df[df["ma20_touch"] == True]
+    
+    if ma20_touched.empty:
+        return None
+    
+    touch_counts = ma20_touched["ma20_touch_type"].value_counts()
+    
+    fig = px.pie(
+        values=touch_counts.values,
+        names=touch_counts.index,
+        title="MA20触碰类型分布",
+        color_discrete_sequence=px.colors.qualitative.Set3
+    )
+    
+    fig.update_layout(
+        template="plotly_white",
+        height=400
+    )
+    
+    return fig
+
 def main():
     # 创建页面头部
     create_header()
     
     # 创建侧边栏并获取参数
-    timeframe, density_threshold, volume_top_percent, show_charts, show_ma_values, min_price = create_ma_sidebar()
+    timeframe, density_threshold, volume_top_percent, show_charts, show_ma_values, min_price, ma20_touch_only = create_ma_sidebar()
     
     # 主要内容区域
     col1, col2 = st.columns([3, 1])
     
     with col2:
         # 扫描按钮
-        if st.button("🚀 开始扫描", key="ma_scan_button"):
+        if st.button("🚀 开始扫描", key="ma_scan_button", help="点击开始扫描均线密集度"):
             scan_pressed = True
         else:
             scan_pressed = False
@@ -566,6 +804,8 @@ def main():
             st.write(f"📊 **成交量过滤**: 前{volume_top_percent}%")
             st.write(f"📈 **均线组合**: MA20/60/120 + EMA20/60/120")
             st.write(f"🔍 **检查范围**: 最近{MAConfig.LOOKBACK_CANDLES}根K线")
+            if ma20_touch_only:
+                st.write(f"🎪 **特殊过滤**: 仅显示MA20触碰")
     
     with col1:
         if not scan_pressed:
@@ -577,17 +817,24 @@ def main():
             - 🎯 扫描6条均线密集通过的区域
             - 📊 MA20/60/120 + EMA20/60/120组合
             - 🔍 检查最近5根K线内的密集情况
+            - 🎪 检测K线是否触碰MA20线
             - 📈 密集度基于当前价格百分比计算
 
             **应用场景**：
             - 🚪 **突破信号**: 价格接近密集区时关注突破
             - 🛡️ **支撑阻力**: 密集区通常形成强支撑/阻力
             - 📊 **趋势转折**: 均线密集区域常是变盘点
+            - 🎪 **MA20信号**: 触碰MA20往往是重要技术信号
 
             **参数说明**：
             - **密集度阈值**: 6条均线价格范围占当前价格的百分比
             - **成交量过滤**: 只扫描活跃度高的合约
             - **位置标识**: 显示密集区相对当前价格的位置
+            - **MA20检测**: 自动检测各种MA20触碰类型
+
+            **图标说明**：
+            - 🎯 极密集(<1%) | 🔥 高密集(1-2%) | 📊 普通密集
+            - 🎪 MA20触碰 | ⬆️ 价格上方 | ⬇️ 价格下方
             """)
             return
     
@@ -606,7 +853,7 @@ def main():
             # 执行扫描
             results, scan_stats = scan_ma_density(
                 base, symbols, timeframe, density_threshold, 
-                volume_top_percent, min_price
+                volume_top_percent, min_price, ma20_touch_only
             )
             
             # 显示扫描统计
@@ -622,15 +869,33 @@ def main():
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             if results:
-                st.markdown(f"### 🎯 均线密集区域发现 (密集度 ≤ {density_threshold}%)")
+                filter_text = "MA20触碰" if ma20_touch_only else "均线密集"
+                st.markdown(f"### 🎯 {filter_text}区域发现 (密集度 ≤ {density_threshold}%)")
                 
-                # 格式化并显示数据
-                results_df = pd.DataFrame(results)
-                formatted_df = format_ma_dataframe(results_df, show_ma_values)
-                st.dataframe(formatted_df, use_container_width=True, hide_index=True)
+                # 分类显示
+                ma20_results = [r for r in results if r["ma20_touch"]]
+                other_results = [r for r in results if not r["ma20_touch"]]
+                
+                if ma20_results:
+                    st.markdown("#### 🎪 MA20触碰信号")
+                    ma20_df = pd.DataFrame(ma20_results)
+                    formatted_ma20 = format_ma_dataframe(ma20_df, show_ma_values)
+                    st.dataframe(formatted_ma20, use_container_width=True, hide_index=True)
+                    
+                    # 显示详细触碰信息
+                    with st.expander("🔍 MA20触碰详情"):
+                        for r in ma20_results[:5]:  # 只显示前5个
+                            st.write(f"**{r['symbol']}**: {r['ma20_touch_detail']}")
+                
+                if other_results and not ma20_touch_only:
+                    st.markdown("#### 📊 其他密集信号")
+                    other_df = pd.DataFrame(other_results)
+                    formatted_other = format_ma_dataframe(other_df, show_ma_values)
+                    st.dataframe(formatted_other, use_container_width=True, hide_index=True)
                 
                 # 下载按钮
-                csv_data = results_df.to_csv(index=False)
+                all_results_df = pd.DataFrame(results)
+                csv_data = all_results_df.to_csv(index=False)
                 st.download_button(
                     label="📥 下载扫描结果 CSV",
                     data=csv_data,
@@ -643,12 +908,23 @@ def main():
                     st.markdown("---")
                     st.markdown("### 📊 数据分析")
                     
-                    chart = create_density_chart(results)
-                    if chart:
-                        st.plotly_chart(chart, use_container_width=True)
+                    chart_col1, chart_col2 = st.columns(2)
+                    
+                    with chart_col1:
+                        density_chart = create_density_chart(results)
+                        if density_chart:
+                            st.plotly_chart(density_chart, use_container_width=True)
+                    
+                    with chart_col2:
+                        ma20_chart = create_ma20_touch_chart(results)
+                        if ma20_chart:
+                            st.plotly_chart(ma20_chart, use_container_width=True)
+                        else:
+                            st.info("📊 暂无MA20触碰数据")
                 
             else:
-                st.info(f"🤔 当前没有发现密集度 ≤ {density_threshold}% 的均线密集区域")
+                filter_text = "MA20触碰且" if ma20_touch_only else ""
+                st.info(f"🤔 当前没有发现{filter_text}密集度 ≤ {density_threshold}% 的均线密集区域")
             
             # 扫描详情
             with st.expander("ℹ️ 扫描详情"):
@@ -662,6 +938,15 @@ def main():
                 
         except Exception as e:
             st.error(f"❌ 扫描过程中发生错误: {str(e)}")
+            logger.error(f"扫描错误: {e}")
+
+    # 页脚
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #666; padding: 1rem;'>
+        <p>📊 均线密集度扫描器 Pro - 捕捉密集区突破机会</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
